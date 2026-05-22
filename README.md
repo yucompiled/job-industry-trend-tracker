@@ -1,6 +1,6 @@
 # Job Industry Trend Tracker
 
-A live data engineering pipeline that tracks skill demand, salary trends, and job posting volume across IT, Finance, and Engineering industries in the US and Canada.
+Ingests 200+ daily job postings, normalizes & extracts skills, stores data in PostgreSQL, and exposes a public Streamlit dashboard for salary and skill demand trends
 
 **Live dashboard: https://job-trend-tracker.streamlit.app**
 
