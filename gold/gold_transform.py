@@ -19,6 +19,16 @@ def run():
     cursor.execute("DELETE FROM gold_salary_trend WHERE snapshot_date = %s", (snapshot_date,))
     cursor.execute("DELETE FROM gold_skill_frequency WHERE snapshot_date = %s", (snapshot_date,))
 
+    # Daily counts: how many new postings were ingested into Bronze today, grouped by category and country.
+    cursor.execute("""
+        SELECT category, country, COUNT(*)
+        FROM bronze_job_postings
+        WHERE DATE(ingested_at) = %s
+        GROUP BY category, country
+    """, (snapshot_date,))
+    daily_count_results = cursor.fetchall()
+    daily_counts = {(category, country): count for category, country, count in daily_count_results}
+
     # Role demand: total job postings per category and country as of today.
     # We store results in a dict so skill frequency can look up the totals without a second query.
     select_query_role_demand = "SELECT category, country, COUNT(*) FROM silver_job_postings GROUP BY category, country"
@@ -26,9 +36,10 @@ def run():
     role_demand_results = cursor.fetchall()
     role_demand_totals = {(category, country): total_postings for category, country, total_postings in role_demand_results}
 
-    insert_query_role_demand = "INSERT INTO gold_role_demand (snapshot_date, category, country, total_postings, aggregated_at) VALUES (%s, %s, %s, %s, %s)"
+    insert_query_role_demand = "INSERT INTO gold_role_demand (snapshot_date, category, country, total_postings, new_postings_today, aggregated_at) VALUES (%s, %s, %s, %s, %s, %s)"
     for category, country, total_postings in role_demand_results:
-        cursor.execute(insert_query_role_demand, (snapshot_date, category, country, total_postings, datetime.now()))
+        new_postings_today = daily_counts.get((category, country), 0)
+        cursor.execute(insert_query_role_demand, (snapshot_date, category, country, total_postings, new_postings_today, datetime.now()))
 
     # Salary trends: averages across postings that have both salary_min and salary_max.
     # posting_count_predicted tracks how many salaries are Adzuna estimates vs employer-reported.
@@ -47,6 +58,7 @@ def run():
     cursor.execute(select_query_salary)
     salary_results = cursor.fetchall()
 
+
     insert_query_salary = "INSERT INTO gold_salary_trend (snapshot_date, category, country, avg_salary_min, avg_salary_max, avg_midpoint, total_salary_postings, posting_count_predicted, aggregated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)"
     for category, country, avg_salary_min, avg_salary_max, avg_midpoint, total_salary_postings, posting_count_predicted in salary_results:
         cursor.execute(insert_query_salary, (snapshot_date, category, country, avg_salary_min, avg_salary_max, avg_midpoint, total_salary_postings, posting_count_predicted, datetime.now()))
@@ -63,6 +75,8 @@ def run():
         total_postings = role_demand_totals.get((category, country), 0)
         pct_of_postings = (skill_posting_count / total_postings) * 100 if total_postings > 0 else 0
         cursor.execute(insert_query_skills, (snapshot_date, skill, country, category, skill_posting_count, total_postings, pct_of_postings, datetime.now()))
+
+
 
     conn.commit()
     print(f"Gold tables updated for snapshot date: {snapshot_date}")

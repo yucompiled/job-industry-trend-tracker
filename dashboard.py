@@ -10,7 +10,7 @@ st.title("Job Industry Trend Tracker")
 # so changing the sidebar doesn't trigger a new database query each time.
 def load_role_demand():
     conn = get_connection()
-    query = "SELECT snapshot_date, category, country, total_postings FROM gold_role_demand"
+    query = "SELECT snapshot_date, category, country, total_postings, new_postings_today FROM gold_role_demand"
     df = pd.read_sql(query, conn)
     conn.close()
     df["snapshot_date"] = pd.to_datetime(df["snapshot_date"], utc=True).dt.tz_convert(None).dt.normalize()
@@ -54,7 +54,8 @@ df_skill_filtered = df_skill[(df_skill["country"] == selected_country) & (df_ski
 # Trend charts side by side.
 col1, col2 = st.columns(2)
 with col1:
-    fig_role = px.line(df_role_filtered, x="snapshot_date", y="total_postings", title="Total Postings Over Time", labels={"total_postings": "Total Job Postings", "snapshot_date": "Date"})
+    fig_role = px.line(df_role_filtered, x="snapshot_date", y="new_postings_today", title="New Postings Per Day", markers=True, labels={"new_postings_today": "New Unique Postings", "snapshot_date": "Date"})
+    fig_role.update_layout(yaxis=dict(rangemode="tozero"))
     st.plotly_chart(fig_role, use_container_width=True)
 
 with col2:
