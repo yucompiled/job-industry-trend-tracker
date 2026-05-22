@@ -23,7 +23,7 @@ Adzuna API > Bronze (raw) > Silver (cleaned) > Gold (aggregated) > Streamlit Das
 
 **Bronze/Silver/Gold medallion architecture:**
 - **Bronze** — Raw API responses, never modified. Source of truth.
-- **Silver** — Cleaned and normalized. Types converted, skills extracted via regex keyword matching, work type detected here.
+- **Silver** — Cleaned and normalized. Types converted, skills extracted via LLM (Groq/Llama 3.1) with regex fallback, work type detected here.
 - **Gold** — Daily snapshots of skill frequency, salary trends, and posting volume by country and by category.
 
 **Infrastructure:**
@@ -39,7 +39,7 @@ Adzuna API > Bronze (raw) > Silver (cleaned) > Gold (aggregated) > Streamlit Das
 |---|---|
 | Ingestion | Python, Requests, Adzuna API |
 | Storage | PostgreSQL (Supabase) |
-| Transformation | Python, psycopg2, Regex |
+| Transformation | Python, psycopg2, Groq API (Llama 3.1), Regex fallback |
 | Orchestration | GitHub Actions |
 | Dashboard | Streamlit, Plotly, Pandas |
 | Deployment | Streamlit Community Cloud, Supabase |
@@ -48,7 +48,7 @@ Adzuna API > Bronze (raw) > Silver (cleaned) > Gold (aggregated) > Streamlit Das
 
 ## Key Design Decisions
 
-- **Keyword matching over NLP** for skill extraction, the skill set is bounded and known, making the approach transparent, zero-dependency, and fully auditable. Trend consistency over time matters more than exhaustive coverage.
+- **LLM skill extraction with regex fallback** — Groq (Llama 3.1) extracts skills from job descriptions without a hardcoded list, catching new tools and frameworks as they emerge. Regex runs as fallback if the API is unavailable, so the pipeline never fails silently.
 - **No backfilling**, tracking forward from April 2026. Pre-AI job market data would introduce noise from conditions that no longer apply.
 - **Gold idempotency**, each daily Gold run deletes and re-inserts today's rows, so running the pipeline twice in a day always reflects the freshest data.
 - **Skill frequency is a lower bound**, Adzuna truncates descriptions at ~500 characters. Counts undercount BUT trends are reliable because truncation is consistent across all snapshots.

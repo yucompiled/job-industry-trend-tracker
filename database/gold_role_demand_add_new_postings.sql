@@ -1,0 +1,1 @@
+ALTER TABLE gold_role_demand ADD COLUMN IF NOT EXISTS new_postings_today INT;

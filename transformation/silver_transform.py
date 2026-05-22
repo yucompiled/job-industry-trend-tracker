@@ -1,9 +1,13 @@
 import sys
 import os
+
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from utils.db_connection import get_connection
-from datetime import datetime, date
+from datetime import datetime
 import re
+
+import json
+from groq import Groq
 
 # Skills we scan for in job postings. Keyword matching was chosen over NLP because
 # this list is bounded and known, making it transparent and easy to audit over time.
@@ -55,7 +59,7 @@ ONSITE_PATTERNS = [r"\bon.?site\b", r"in.office", r"in the office"]
 # "Go" is a common English word and would match finance job descriptions without this.
 CASE_SENSITIVE_SKILLS = {"Go"}
 
-
+# Fallback should LLM fail
 def extract_skills(description):
     if not description:
         return []
@@ -71,6 +75,28 @@ def extract_skills(description):
                 found.append(skill)
     return found
 
+def extract_skills_llm(title, description, model):
+    try:
+        prompt = f"""Extract all technical skills, tools, programming languages, and technologies from this job posting.
+Return ONLY a JSON array of strings. No explanation, no markdown, no extra text.
+Use short canonical names: "Spark" not "Apache Spark", "Kubernetes" not "k8s", "PostgreSQL" not "Postgres".
+Example output: ["Python", "SQL", "AWS", "dbt"]
+If none found, return: []
+
+Job posting:
+Title: {title}
+Description: {description}"""
+        response = model.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        skills = json.loads(response.choices[0].message.content.strip())
+        if isinstance(skills, list):
+            return [s for s in skills if isinstance(s,str)]
+        return []
+    except Exception as e:
+        print(f"LLM skill extraction failed: {e}")
+        return None
 
 def extract_work_type(description):
     if not description:
@@ -101,6 +127,13 @@ def parse_date(date_str):
 def run():
     conn = get_connection()
     cursor = conn.cursor()
+
+    api_key = os.getenv("GROQ_API_KEY")
+    groq_client = None
+    if api_key:
+        groq_client = Groq(api_key=api_key)
+    else:
+        print("GROQ_API_KEY not set — using regex fallback for skill extraction")
 
     # Only pull Bronze rows that haven't been transformed yet.
     cursor.execute("""
@@ -140,9 +173,12 @@ def run():
         created_date = parse_date(created)
         work_type = extract_work_type(description)
 
-        # Scan title and description combined because Adzuna truncates descriptions at around 500 characters.
-        # Skills mentioned only in the title would otherwise be missed.
-        skills = extract_skills((title or "") + " " + (description or ""))
+        if groq_client:
+            skills = extract_skills_llm(title, description, groq_client)
+            if skills is None:
+                skills = extract_skills((title or "") + " " + (description or ""))
+        else:
+            skills = extract_skills((title or "") + " " + (description or ""))
 
         cursor.execute(insert_query, (
             job_id, title, description, location, company,

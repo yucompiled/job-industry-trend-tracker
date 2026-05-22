@@ -1,6 +1,7 @@
-﻿psycopg2-binary==2.9.12
+psycopg2-binary==2.9.12
 requests==2.33.1
 python-dotenv==1.2.2
 streamlit
 plotly
 pandas
+groq
