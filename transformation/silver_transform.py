@@ -59,6 +59,27 @@ ONSITE_PATTERNS = [r"\bon.?site\b", r"in.office", r"in the office"]
 # "Go" is a common English word and would match finance job descriptions without this.
 CASE_SENSITIVE_SKILLS = {"Go"}
 
+# Canonical role types. The LLM must pick exactly one from this list.
+# Constrained output prevents the model from inventing taxonomy we can't defend.
+ROLE_TYPES = [
+    "data_engineering",
+    "data_science",
+    "ml_engineering",
+    "data_analytics",
+    "software_engineering",
+    "devops",
+    "security_engineering",
+    "mobile_engineering",
+    "financial_analyst",
+    "accounting",
+    "quantitative_finance",
+    "mechanical_engineering",
+    "electrical_engineering",
+    "civil_engineering",
+    "chemical_engineering",
+    "other",
+]
+
 # Fallback should LLM fail
 def extract_skills(description):
     if not description:
@@ -101,6 +122,34 @@ Description: {description}"""
     except Exception as e:
         print(f"LLM skill extraction failed: {e}")
         return None
+
+def extract_role_type_llm(title, description, model):
+    try:
+        allowed = ", ".join(ROLE_TYPES)
+        prompt = f"""Classify this job posting into exactly one role type from this list:
+{allowed}
+
+Return ONLY the role type as a single lowercase string. No explanation, no quotes, no markdown.
+If the role doesn't clearly fit any technical category, return: other
+
+Job posting:
+Title: {title}
+Description: {description}"""
+        response = model.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = response.choices[0].message.content.strip().lower()
+        # Strip quotes or backticks the model might add despite instructions
+        raw = raw.strip('"\'`')
+        if raw in ROLE_TYPES:
+            return raw
+        # Model returned something unexpected — fall to 'other' rather than NULL
+        return "other"
+    except Exception as e:
+        print(f"LLM role classification failed: {e}")
+        return None
+
 
 def extract_work_type(description):
     if not description:
@@ -159,9 +208,9 @@ def run():
             job_id, title, description, location, company,
             salary_min, salary_max, salary_is_predicted,
             created, category, country,
-            work_type, skills, transformed_at
+            work_type, skills, skills_source, role_type, transformed_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (job_id) DO NOTHING
     """
 
@@ -181,14 +230,20 @@ def run():
             skills = extract_skills_llm(title, description, groq_client)
             if skills is None:
                 skills = extract_skills((title or "") + " " + (description or ""))
+                skills_source = "regex"
+            else:
+                skills_source = "llm"
+            role_type = extract_role_type_llm(title, description, groq_client)
         else:
             skills = extract_skills((title or "") + " " + (description or ""))
+            skills_source = "regex"
+            role_type = None
 
         cursor.execute(insert_query, (
             job_id, title, description, location, company,
             salary_min, salary_max, salary_is_predicted_bool,
             created_date, category, country,
-            work_type, skills, transformed_at
+            work_type, skills, skills_source, role_type, transformed_at
         ))
 
     conn.commit()
