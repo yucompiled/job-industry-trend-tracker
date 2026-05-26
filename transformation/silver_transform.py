@@ -90,7 +90,11 @@ Description: {description}"""
             model="llama-3.1-8b-instant",
             messages=[{"role": "user", "content": prompt}]
         )
-        skills = json.loads(response.choices[0].message.content.strip())
+        raw = response.choices[0].message.content.strip()
+        match = re.search(r'\[.*?\]', raw, re.DOTALL)
+        if not match:
+            raise ValueError(f"No JSON array found in response: {raw[:100]}")
+        skills = json.loads(match.group())
         if isinstance(skills, list):
             return [s for s in skills if isinstance(s,str)]
         return []
