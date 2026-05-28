@@ -17,7 +17,9 @@ def run():
         conn.close()
         return
 
-    groq_client = Groq(api_key=api_key)
+    # timeout so a hung request errors out and gets retried next run
+    # instead of blocking the whole backfill indefinitely.
+    groq_client = Groq(api_key=api_key, timeout=30.0)
 
     # Only process rows that haven't been classified yet.
     cursor.execute("""

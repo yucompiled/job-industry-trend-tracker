@@ -184,7 +184,7 @@ def run():
     api_key = os.getenv("GROQ_API_KEY")
     groq_client = None
     if api_key:
-        groq_client = Groq(api_key=api_key)
+        groq_client = Groq(api_key=api_key, timeout=30.0)
     else:
         print("GROQ_API_KEY not set — using regex fallback for skill extraction")
 
