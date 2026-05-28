@@ -17,9 +17,10 @@ def run():
         conn.close()
         return
 
-    # timeout so a hung request errors out and gets retried next run
-    # instead of blocking the whole backfill indefinitely.
-    groq_client = Groq(api_key=api_key, timeout=30.0)
+    # timeout so a hung request errors out instead of blocking forever.
+    # max_retries=0 so a 429 raises immediately and we stop cleanly,
+    # rather than the SDK silently retrying against an exhausted quota.
+    groq_client = Groq(api_key=api_key, timeout=30.0, max_retries=0)
 
     # Only process rows that haven't been classified yet.
     cursor.execute("""
