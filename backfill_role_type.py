@@ -2,8 +2,14 @@ from transformation.silver_transform import extract_role_type_llm
 import os
 from dotenv import load_dotenv
 from utils.db_connection import get_connection
-from groq import Groq
+from groq import Groq, RateLimitError
 import time
+
+# Each role call is ~275 tokens; free-tier TPM is 6,000, so ~21 calls/min is the
+# ceiling. Spacing calls ~3s apart keeps us just under it, so we rarely trip the
+# per-minute limit instead of constantly bouncing off it (and burning the daily
+# 14,400-request budget on rejected calls).
+THROTTLE_SECONDS = 3
 
 
 def run():
@@ -17,9 +23,8 @@ def run():
         conn.close()
         return
 
-    # timeout so a hung request errors out instead of blocking forever.
-    # max_retries=0 so a 429 raises immediately and we stop cleanly,
-    # rather than the SDK silently retrying against an exhausted quota.
+    # max_retries=0: we handle retries in groq_chat_with_retry so we can tell a
+    # per-minute hiccup (wait & retry) apart from a daily cap (stop the run).
     groq_client = Groq(api_key=api_key, timeout=30.0, max_retries=0)
 
     # Only process rows that haven't been classified yet.
@@ -37,28 +42,27 @@ def run():
     for job_id, title, description in rows:
         try:
             role_type = extract_role_type_llm(title, description, groq_client)
-            if role_type is None:
-                # LLM returned None — treat as failure, leave row NULL for next run
-                failed += 1
-                continue
+        except RateLimitError:
+            print(f"Daily token limit reached after {updated} rows. "
+                  f"Stopping — quota resets at UTC midnight.")
+            break
 
-            cursor.execute(
-                "UPDATE silver_job_postings SET role_type = %s WHERE job_id = %s",
-                (role_type, job_id)
-            )
-            updated += 1
-
-            if updated % 50 == 0:
-                conn.commit()
-                print(f"Progress: {updated}/{len(rows)}")
-                time.sleep(2)
-
-        except Exception as e:
-            if "429" in str(e):
-                print(f"Token limit reached after {updated} rows. Stopping — re-run tomorrow.")
-                break
-            print(f"Skipping job_id {job_id}: {e}")
+        if role_type is None:
+            # Non-rate-limit failure — leave row NULL for the next run.
             failed += 1
+            continue
+
+        cursor.execute(
+            "UPDATE silver_job_postings SET role_type = %s WHERE job_id = %s",
+            (role_type, job_id)
+        )
+        updated += 1
+
+        if updated % 50 == 0:
+            conn.commit()
+            print(f"Progress: {updated}/{len(rows)}")
+
+        time.sleep(THROTTLE_SECONDS)
 
     conn.commit()
     conn.close()

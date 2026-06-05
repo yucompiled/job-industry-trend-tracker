@@ -32,10 +32,19 @@ def load_skill_frequency():
     df["snapshot_date"] = pd.to_datetime(df["snapshot_date"], utc=True).dt.tz_convert(None).dt.normalize()
     return df.sort_values("snapshot_date")
 
-# Load all three Gold tables once at startup.
+def load_role_type_skill_frequency():
+    conn = get_connection()
+    query = "SELECT snapshot_date, skill, country, role_type, pct_of_postings, skill_posting_count, total_postings FROM gold_role_type_skill_frequency"
+    df = pd.read_sql(query, conn)
+    conn.close()
+    df["snapshot_date"] = pd.to_datetime(df["snapshot_date"], utc=True).dt.tz_convert(None).dt.normalize()
+    return df.sort_values("snapshot_date")
+
+# Load the Gold tables once at startup.
 df_role = load_role_demand()
 df_salary = load_salary_trend()
 df_skill = load_skill_frequency()
+df_role_skill = load_role_type_skill_frequency()
 
 # Sidebar filters. Options are pulled from the data itself so new countries or
 # categories show up automatically as the dataset grows.
@@ -44,36 +53,74 @@ with st.sidebar:
     selected_country = st.selectbox("Select Country", options=sorted(df_role["country"].unique()))
     selected_category = st.selectbox("Select Category", options=sorted(df_role["category"].unique()))
 
+    # role_type drives the role-level skills chart only; the category charts above still use category.
+    # Default to data_engineering (the role this project centers on) when it's present, rather than
+    # opening on alphabetical 'accounting', which detects almost no skills.
+    role_type_options = sorted(df_role_skill["role_type"].unique())
+    default_role_index = role_type_options.index("data_engineering") if "data_engineering" in role_type_options else 0
+    selected_role_type = st.selectbox("Select Role Type (skills)", options=role_type_options, index=default_role_index)
+
 # Apply sidebar selections to each dataset. No new queries, just filtering in memory.
 df_role_filtered = df_role[(df_role["country"] == selected_country) & (df_role["category"] == selected_category)]
 df_salary_filtered = df_salary[(df_salary["country"] == selected_country) & (df_salary["category"] == selected_category)]
 df_skill_filtered = df_skill[(df_skill["country"] == selected_country) & (df_skill["category"] == selected_category)]
+df_role_skill_filtered = df_role_skill[(df_role_skill["country"] == selected_country) & (df_role_skill["role_type"] == selected_role_type)]
 
 # st.dataframe(df_role_filtered)
 
-# Trend charts side by side.
-col1, col2 = st.columns(2)
-with col1:
-    fig_role = px.line(df_role_filtered, x="snapshot_date", y="new_postings_today", title="New Postings Per Day", markers=True, labels={"new_postings_today": "New Unique Postings", "snapshot_date": "Date"})
-    fig_role.update_layout(yaxis=dict(rangemode="tozero"))
-    st.plotly_chart(fig_role, use_container_width=True)
+# Two tabs separate the two lenses: category-level market overview vs role-level skills.
+tab_overview, tab_roles = st.tabs(["Market Overview", "Skills by Role"])
 
-with col2:
-    fig_salary = px.line(df_salary_filtered, x="snapshot_date", y="avg_midpoint", title="Average Salary Midpoint Over Time", labels={"avg_midpoint": "Average Salary Midpoint", "snapshot_date": "Date"})
-    st.plotly_chart(fig_salary, use_container_width=True)
+with tab_overview:
+    # Trend charts side by side.
+    col1, col2 = st.columns(2)
+    with col1:
+        fig_role = px.line(df_role_filtered, x="snapshot_date", y="new_postings_today", title="New Postings Per Day", markers=True, labels={"new_postings_today": "New Unique Postings", "snapshot_date": "Date"})
+        fig_role.update_layout(yaxis=dict(rangemode="tozero"))
+        st.plotly_chart(fig_role, use_container_width=True)
 
-# Skill frequency snapshot for the most recent date only.
-# Filtering to one date avoids duplicate bars when multiple snapshots exist.
-if df_skill_filtered.empty:
-    st.info("No skill data available for the selected filters.")
-else:
-    latest_date = df_skill_filtered["snapshot_date"].max()
-    st.subheader(f"Latest Top Skills Demand - {latest_date.strftime('%Y-%m-%d')}")
-    df_skill_top = df_skill_filtered[df_skill_filtered["snapshot_date"] == latest_date].sort_values(by="pct_of_postings", ascending=False).head(15).sort_values(by="pct_of_postings", ascending=True)
-    sample_size = df_skill_top["total_postings"].iloc[0]
+    with col2:
+        fig_salary = px.line(df_salary_filtered, x="snapshot_date", y="avg_midpoint", title="Average Salary Midpoint Over Time", labels={"avg_midpoint": "Average Salary Midpoint", "snapshot_date": "Date"})
+        st.plotly_chart(fig_salary, use_container_width=True)
 
-    fig_skill = px.bar(df_skill_top, x="pct_of_postings", y="skill", orientation="h", title="Top 15 Skills by Percentage of Job Postings", labels={"pct_of_postings": "% of Job Postings", "skill": "Skill"})
-    fig_skill.update_layout(xaxis_tickformat=".2f")
-    st.plotly_chart(fig_skill, use_container_width=True)
+    # Skill frequency snapshot for the most recent date only.
+    # Filtering to one date avoids duplicate bars when multiple snapshots exist.
+    if df_skill_filtered.empty:
+        st.info("No skill data available for the selected filters.")
+    else:
+        latest_date = df_skill_filtered["snapshot_date"].max()
+        st.subheader(f"Latest Top Skills Demand - {latest_date.strftime('%Y-%m-%d')}")
+        df_skill_top = df_skill_filtered[df_skill_filtered["snapshot_date"] == latest_date].sort_values(by="pct_of_postings", ascending=False).head(15).sort_values(by="pct_of_postings", ascending=True)
+        sample_size = df_skill_top["total_postings"].iloc[0]
 
-    st.caption(f"Based on {sample_size} total postings")
+        fig_skill = px.bar(df_skill_top, x="pct_of_postings", y="skill", orientation="h", title="Top 15 Skills by Percentage of Job Postings", labels={"pct_of_postings": "% of Job Postings", "skill": "Skill"})
+        fig_skill.update_layout(xaxis_tickformat=".2f")
+        st.plotly_chart(fig_skill, use_container_width=True)
+
+        st.caption(f"Based on {sample_size} total postings")
+
+with tab_roles:
+    # Skills by role_type — reads gold_role_type_skill_frequency, independent of the category filter.
+    # Answers "what does <role> demand?" instead of "what does <category> demand?".
+    # Only tech/data roles appear here (gold_transform restricts to SKILL_ROLE_TYPES), because the
+    # skill vocabulary is tech-focused and other roles produced near-empty/noisy skill data.
+    st.subheader(f"Top Skills by Role: {selected_role_type}")
+    if df_role_skill_filtered.empty:
+        st.info(f"No skill data yet for {selected_role_type} in {selected_country.upper()}.")
+    else:
+        latest_role_date = df_role_skill_filtered["snapshot_date"].max()
+        df_role_skill_top = df_role_skill_filtered[df_role_skill_filtered["snapshot_date"] == latest_role_date].sort_values(by="pct_of_postings", ascending=False).head(15).sort_values(by="pct_of_postings", ascending=True)
+        role_sample_size = df_role_skill_top["total_postings"].iloc[0]
+
+        fig_role_skill = px.bar(df_role_skill_top, x="pct_of_postings", y="skill", orientation="h", title=f"Top Skills for {selected_role_type} - {latest_role_date.strftime('%Y-%m-%d')}", labels={"pct_of_postings": "% of Role Postings", "skill": "Skill"})
+        fig_role_skill.update_layout(xaxis_tickformat=".2f")
+        st.plotly_chart(fig_role_skill, use_container_width=True)
+
+        st.caption(f"Based on {role_sample_size} {selected_role_type} postings in {selected_country.upper()}")
+        # Small-sample guard: with very few postings, a single mention reads as a huge percentage
+        # (a role with 2 postings shows every skill at 50%). Warn rather than mislead.
+        if role_sample_size < 10:
+            st.warning(f"Small sample ({role_sample_size} postings) — percentages are volatile and will firm up as data accumulates.")
+        # Skills come from truncated 500-char postings, so coverage is a lower bound, not a ceiling.
+        if df_role_skill_top["pct_of_postings"].max() < 5:
+            st.caption("Few skills detected — skills are extracted from truncated postings, so this is a lower bound.")

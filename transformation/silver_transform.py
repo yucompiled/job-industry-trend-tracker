@@ -7,7 +7,8 @@ from datetime import datetime
 import re
 
 import json
-from groq import Groq
+import time
+from groq import Groq, RateLimitError
 
 # Skills we scan for in job postings. Keyword matching was chosen over NLP because
 # this list is bounded and known, making it transparent and easy to audit over time.
@@ -59,6 +60,47 @@ ONSITE_PATTERNS = [r"\bon.?site\b", r"in.office", r"in the office"]
 # "Go" is a common English word and would match finance job descriptions without this.
 CASE_SENSITIVE_SKILLS = {"Go"}
 
+# Variant spellings (lowercase key) -> canonical display name. Curated from observed LLM output.
+# Normalizing here in Silver stops Gold from splitting one real skill across several spellings
+# (e.g. SAS / SAS Viya / SAS Studio all counted separately).
+SKILL_ALIASES = {
+    "postgres": "PostgreSQL",
+    "postgresql": "PostgreSQL",
+    "oracle db": "Oracle",
+    "oracle database": "Oracle",
+    "reactjs": "React",
+    "react.js": "React",
+    "react js": "React",
+    "nodejs": "Node.js",
+    "node js": "Node.js",
+    "javac": "Java",
+    "k8s": "Kubernetes",
+    "sas viya": "SAS",
+    "sas studio": "SAS",
+    "sas enterprise miner": "SAS",
+    "sas base": "SAS",
+    "powerbi": "Power BI",
+    "power-bi": "Power BI",
+    "sklearn": "scikit-learn",
+    "scikit learn": "scikit-learn",
+    "amazon web services": "AWS",
+    "google cloud platform": "GCP",
+    "microsoft excel": "Excel",
+    "ms excel": "Excel",
+    "apache spark": "Spark",
+    "apache kafka": "Kafka",
+    "apache airflow": "Airflow",
+    "apache hadoop": "Hadoop",
+    "apache hive": "Hive",
+    "apache flink": "Flink",
+}
+
+# Reverse index: canonical (lowercase) -> all spellings to check when grounding, so a skill the
+# LLM normalized (e.g. "AWS") is still matched when the posting wrote a variant ("Amazon Web Services").
+_SKILL_SPELLINGS = {}
+for _variant, _canon in SKILL_ALIASES.items():
+    _SKILL_SPELLINGS.setdefault(_canon.lower(), {_canon.lower()}).add(_variant)
+
 # Canonical role types. The LLM must pick exactly one from this list.
 # Constrained output prevents the model from inventing taxonomy we can't defend.
 ROLE_TYPES = [
@@ -96,20 +138,113 @@ def extract_skills(description):
                 found.append(skill)
     return found
 
-def extract_skills_llm(title, description, model):
+
+# --- Skill cleaning: grounding + canonicalization -----------------------------
+def canonicalize_skill(skill):
+    """Map a single skill to its canonical spelling, or return it unchanged."""
+    return SKILL_ALIASES.get(skill.strip().lower(), skill.strip())
+
+
+def _skill_in_text(skill, text):
+    """True if `skill` appears in `text`, not flanked by other alphanumerics.
+    The custom boundary handles symbol skills like C++/C#/.NET that \\b mishandles, and
+    prevents substring hits (e.g. 'Java' inside 'JavaScript', 'Go' inside 'category')."""
+    pattern = r"(?<![A-Za-z0-9])" + re.escape(skill) + r"(?![A-Za-z0-9])"
+    return re.search(pattern, text, re.IGNORECASE) is not None
+
+
+def clean_skills(skills, text):
+    """Ground, then canonicalize, an extracted skill list.
+
+    1. Grounding  - drop any skill whose spelling does not literally appear in the source text.
+                    Kills LLM hallucinations (e.g. 'dbt' on a bass-fishing posting) while keeping
+                    the LLM's open vocabulary. Restores the precision of keyword matching.
+    2. Canonical  - collapse variant spellings (Postgres -> PostgreSQL, SAS Viya -> SAS).
+    3. Dedupe     - one entry per canonical skill, original order preserved.
+    """
+    if not skills:
+        return []
+    text = text or ""
+    cleaned = []
+    seen = set()
+    for skill in skills:
+        if not isinstance(skill, str) or not skill.strip():
+            continue
+        canon = canonicalize_skill(skill)
+        # Ground against the raw form, the canonical, and any known alias spellings.
+        candidates = {skill.lower(), canon.lower()} | _SKILL_SPELLINGS.get(canon.lower(), set())
+        if not any(_skill_in_text(c, text) for c in candidates):
+            continue
+        if canon.lower() not in seen:
+            seen.add(canon.lower())
+            cleaned.append(canon)
+    return cleaned
+
+
+# --- Groq rate-limit handling -------------------------------------------------
+# Free-tier TPM is only 6,000 tokens/min. Under load Groq returns HTTP 429 with a
+# short retry-after (often <1s) — those are TRANSIENT: wait the told interval and
+# retry the same call. A daily (TPD) exhaustion sends a long retry-after that will
+# not clear until the UTC-midnight reset; that is TERMINAL, so we surface it and
+# let the caller stop instead of spinning against an empty quota.
+TRANSIENT_RETRY_CAP_SECONDS = 60
+MAX_RATE_LIMIT_RETRIES = 8
+
+
+def _retry_after_seconds(error, default=5.0):
+    """Best-effort read of how long Groq wants us to wait, in seconds."""
+    response = getattr(error, "response", None)
+    if response is not None:
+        header = response.headers.get("retry-after")
+        if header:
+            try:
+                return float(header)
+            except ValueError:
+                pass
+    # Header missing (common for sub-second waits) — parse the message text.
+    message = str(error)
+    ms = re.search(r"try again in ([\d.]+)ms", message)
+    if ms:
+        return float(ms.group(1)) / 1000.0
+    secs = re.search(r"try again in ([\d.]+)s", message)
+    if secs:
+        return float(secs.group(1))
+    return default
+
+
+def groq_chat_with_retry(client, **create_kwargs):
+    """Call chat.completions.create, waiting out transient per-minute 429s.
+
+    Re-raises RateLimitError when the limit is a daily one (retry-after longer
+    than a minute) or when retries are exhausted, so the caller decides to stop.
+    """
+    last_error = None
+    for _ in range(MAX_RATE_LIMIT_RETRIES):
+        try:
+            return client.chat.completions.create(**create_kwargs)
+        except RateLimitError as e:
+            last_error = e
+            wait = _retry_after_seconds(e)
+            if wait > TRANSIENT_RETRY_CAP_SECONDS:
+                raise  # daily budget — will not clear until UTC midnight
+            time.sleep(wait + 0.5)  # small buffer so the rolling window has cleared
+    raise last_error
+
+
+def extract_skills_llm(title, description, client):
     try:
-        prompt = f"""Extract all technical skills, tools, programming languages, and technologies from this job posting.
-Return ONLY a JSON array of strings. No explanation, no markdown, no extra text.
-Use short canonical names: "Spark" not "Apache Spark", "Kubernetes" not "k8s", "PostgreSQL" not "Postgres".
-Example output: ["Python", "SQL", "AWS", "dbt"]
-If none found, return: []
+        prompt = f"""Extract only the technical skills, tools, programming languages, and technologies that are EXPLICITLY written in this job posting. Do not infer, guess, or add anything that is not literally present in the text.
+Return ONLY a JSON array of skill strings, for example ["...", "..."]. No explanation, no markdown, no extra text.
+Prefer short, common names over long vendor forms.
+If no skills are explicitly stated, return: []
 
 Job posting:
 Title: {title}
 Description: {description}"""
-        response = model.chat.completions.create(
+        response = groq_chat_with_retry(
+            client,
             model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
         )
         raw = response.choices[0].message.content.strip()
         match = re.search(r'\[.*?\]', raw, re.DOTALL)
@@ -117,13 +252,16 @@ Description: {description}"""
             raise ValueError(f"No JSON array found in response: {raw[:100]}")
         skills = json.loads(match.group())
         if isinstance(skills, list):
-            return [s for s in skills if isinstance(s,str)]
+            raw = [s for s in skills if isinstance(s, str)]
+            return clean_skills(raw, (title or "") + " " + (description or ""))
         return []
+    except RateLimitError:
+        raise  # terminal rate limit — let the caller stop the run
     except Exception as e:
         print(f"LLM skill extraction failed: {e}")
         return None
 
-def extract_role_type_llm(title, description, model):
+def extract_role_type_llm(title, description, client):
     try:
         allowed = ", ".join(ROLE_TYPES)
         prompt = f"""Classify this job posting into exactly one role type from this list:
@@ -135,9 +273,10 @@ If the role doesn't clearly fit any technical category, return: other
 Job posting:
 Title: {title}
 Description: {description}"""
-        response = model.chat.completions.create(
+        response = groq_chat_with_retry(
+            client,
             model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
         )
         raw = response.choices[0].message.content.strip().lower()
         # Strip quotes or backticks the model might add despite instructions
@@ -146,6 +285,8 @@ Description: {description}"""
             return raw
         # Model returned something unexpected — fall to 'other' rather than NULL
         return "other"
+    except RateLimitError:
+        raise  # terminal rate limit — let the caller stop the run
     except Exception as e:
         print(f"LLM role classification failed: {e}")
         return None
@@ -217,6 +358,12 @@ def run():
     # Set once so all rows in this batch share the same timestamp, making batch runs easy to identify.
     transformed_at = datetime.now()
 
+    # If we burn through the daily Groq budget mid-run, stop calling the LLM and
+    # finish the batch on regex. Losing a day of ingestion would be worse than
+    # losing LLM enrichment on the tail of one batch; role_type stays NULL so the
+    # backfill picks those rows up once the quota resets.
+    llm_exhausted = False
+
     for row in rows:
         (job_id, title, description, location, company,
          salary_min, salary_max, salary_is_predicted,
@@ -226,14 +373,21 @@ def run():
         created_date = parse_date(created)
         work_type = extract_work_type(description)
 
-        if groq_client:
-            skills = extract_skills_llm(title, description, groq_client)
-            if skills is None:
+        if groq_client and not llm_exhausted:
+            try:
+                skills = extract_skills_llm(title, description, groq_client)
+                if skills is None:
+                    skills = extract_skills((title or "") + " " + (description or ""))
+                    skills_source = "regex"
+                else:
+                    skills_source = "llm"
+                role_type = extract_role_type_llm(title, description, groq_client)
+            except RateLimitError:
+                print("Groq daily limit hit — remaining rows use regex fallback.")
+                llm_exhausted = True
                 skills = extract_skills((title or "") + " " + (description or ""))
                 skills_source = "regex"
-            else:
-                skills_source = "llm"
-            role_type = extract_role_type_llm(title, description, groq_client)
+                role_type = None
         else:
             skills = extract_skills((title or "") + " " + (description or ""))
             skills_source = "regex"
